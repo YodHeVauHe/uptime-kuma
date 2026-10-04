@@ -312,6 +312,8 @@
                                                 max="9999-12-31T23:59"
                                                 class="form-control"
                                                 :required="maintenance.strategy === 'single'"
+                                                @input="onStartDateInput"
+                                                @change="onStartDateInput"
                                             />
                                         </div>
 
@@ -322,9 +324,15 @@
                                                 type="datetime-local"
                                                 max="9999-12-31T23:59"
                                                 class="form-control"
+                                                :class="{ 'is-invalid': endBeforeStart }"
                                                 :required="maintenance.strategy === 'single'"
+                                                @input="onEndDateInput"
+                                                @change="onEndDateInput"
                                             />
                                         </div>
+                                    </div>
+                                    <div v-if="endBeforeStart" class="form-text text-danger">
+                                        {{ $t("endDateBeforeStartDate") }}
                                     </div>
                                 </div>
                             </template>
@@ -446,6 +454,13 @@
 import VueMultiselect from "vue-multiselect";
 import Datepicker from "@vuepic/vue-datepicker";
 import { timezoneList } from "../util-frontend";
+import {
+    durationMinutesBetween,
+    endAfterStartChange,
+    endDateTimeFromDuration,
+    formatDateTimeLocal,
+    isEndBeforeStart,
+} from "../maintenance-date-range.mjs";
 import cronstrue from "cronstrue/i18n";
 import Confirm from "../components/Confirm.vue";
 
@@ -461,6 +476,9 @@ export default {
             timezoneList: timezoneList(),
             processing: false,
             maintenance: {},
+            // Duration that follows the start time until the user edits the end time.
+            endDateManuallyEdited: false,
+            selectedDurationMinutes: 60,
             affectedMonitors: [],
             affectedMonitorsOptions: [],
             showOnAllPages: false,
@@ -610,15 +628,16 @@ export default {
          * @returns {number|null} Duration in minutes, or null if dates are invalid
          */
         currentDurationMinutes() {
-            if (!this.maintenance.dateRange?.[0] || !this.maintenance.dateRange?.[1]) {
-                return null;
-            }
-            const start = new Date(this.maintenance.dateRange[0]);
-            const end = new Date(this.maintenance.dateRange[1]);
-            if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-                return null;
-            }
-            return Math.round((end.getTime() - start.getTime()) / 60000);
+            return durationMinutesBetween(this.maintenance.dateRange?.[0], this.maintenance.dateRange?.[1]);
+        },
+
+        /**
+         * Whether the end datetime is strictly earlier than the start datetime.
+         * Incomplete values stay valid so the user can type the end time first.
+         * @returns {boolean} True when the range is incoherent.
+         */
+        endBeforeStart() {
+            return isEndBeforeStart(this.maintenance.dateRange?.[0], this.maintenance.dateRange?.[1]);
         },
     },
     watch: {
@@ -677,20 +696,13 @@ export default {
         init() {
             this.affectedMonitors = [];
             this.selectedStatusPages = [];
+            this.endDateManuallyEdited = false;
+            this.selectedDurationMinutes = null;
 
             if (this.isAdd) {
                 // Get current date/time in local timezone
                 const now = new Date();
                 const oneHourLater = new Date(now.getTime() + 60 * 60000);
-
-                const formatDateTime = (date) => {
-                    const year = date.getFullYear();
-                    const month = String(date.getMonth() + 1).padStart(2, "0");
-                    const day = String(date.getDate()).padStart(2, "0");
-                    const hours = String(date.getHours()).padStart(2, "0");
-                    const minutes = String(date.getMinutes()).padStart(2, "0");
-                    return `${year}-${month}-${day}T${hours}:${minutes}`;
-                };
 
                 this.maintenance = {
                     title: "",
@@ -700,7 +712,7 @@ export default {
                     cron: "30 3 * * *",
                     durationMinutes: 60,
                     intervalDay: 1,
-                    dateRange: [formatDateTime(now), formatDateTime(oneHourLater)],
+                    dateRange: [formatDateTimeLocal(now), formatDateTimeLocal(oneHourLater)],
                     timeRange: [
                         {
                             hours: 2,
@@ -715,10 +727,12 @@ export default {
                     daysOfMonth: [],
                     timezoneOption: "SAME_AS_SERVER",
                 };
+                this.captureSelectedDuration();
             } else if (this.isEdit || this.isClone) {
                 this.$root.getSocket().emit("getMaintenance", this.$route.params.id, (res) => {
                     if (res.ok) {
                         this.maintenance = res.maintenance;
+                        this.captureSelectedDuration();
 
                         if (this.isClone) {
                             this.maintenance.id = undefined; // Remove id when cloning as we want a new id
@@ -789,16 +803,76 @@ export default {
                 return;
             }
 
-            const startDate = new Date(this.maintenance.dateRange[0]);
-            const endDate = new Date(startDate.getTime() + minutes * 60000);
+            const end = endDateTimeFromDuration(this.maintenance.dateRange[0], minutes);
+            if (!end) {
+                this.$root.toastError(this.$t("Please set start time first"));
+                return;
+            }
 
-            const year = endDate.getFullYear();
-            const month = String(endDate.getMonth() + 1).padStart(2, "0");
-            const day = String(endDate.getDate()).padStart(2, "0");
-            const hours = String(endDate.getHours()).padStart(2, "0");
-            const mins = String(endDate.getMinutes()).padStart(2, "0");
+            // Picking a duration replaces a manual end time, so later start edits follow it again.
+            this.selectedDurationMinutes = minutes;
+            this.endDateManuallyEdited = false;
+            this.maintenance.dateRange[1] = end;
+        },
 
-            this.maintenance.dateRange[1] = `${year}-${month}-${day}T${hours}:${mins}`;
+        /**
+         * Remember the current window length so a later start-time edit can keep it.
+         * A negative window is treated as a manual end time and is not shifted.
+         * @returns {void}
+         */
+        captureSelectedDuration() {
+            const minutes = durationMinutesBetween(this.maintenance.dateRange?.[0], this.maintenance.dateRange?.[1]);
+            if (minutes == null || minutes < 0) {
+                this.selectedDurationMinutes = null;
+                this.endDateManuallyEdited = minutes != null && minutes < 0;
+                return;
+            }
+
+            this.selectedDurationMinutes = minutes;
+            this.endDateManuallyEdited = false;
+        },
+
+        /**
+         * Recompute the end time from the selected duration.
+         * Skipped after the user has edited the end time, and for strategies whose
+         * date range is an effective period rather than the window length.
+         * @param {Event} event Input event from the start datetime field.
+         * @returns {void}
+         */
+        onStartDateInput(event) {
+            const end = endAfterStartChange({
+                strategy: this.maintenance.strategy,
+                endManuallyEdited: this.endDateManuallyEdited,
+                selectedDurationMinutes: this.selectedDurationMinutes,
+                start: event.target.value,
+            });
+            if (!end) {
+                return;
+            }
+
+            this.maintenance.dateRange[1] = end;
+        },
+
+        /**
+         * Remember that the end time was chosen by the user.
+         * The value is kept even when it is earlier than the start; saving rejects that.
+         * @returns {void}
+         */
+        onEndDateInput() {
+            this.endDateManuallyEdited = true;
+        },
+
+        /**
+         * Stop saving when the end datetime is earlier than the start datetime.
+         * @returns {boolean} True when saving should stop.
+         */
+        dateRangeIsInvalid() {
+            if (!this.endBeforeStart) {
+                return false;
+            }
+
+            this.$root.toastError(this.$t("endDateBeforeStartDate"));
+            return true;
         },
 
         /**
@@ -806,6 +880,10 @@ export default {
          * @returns {void}
          */
         submit() {
+            if (this.dateRangeIsInvalid()) {
+                return;
+            }
+
             // While unusual, not requiring montiors can allow showing on status pages if a "currently unmonitored" service goes down
             if (!this.hasMonitors && this.hasStatusPages) {
                 this.$refs.confirmNoMonitors.show();
@@ -819,6 +897,10 @@ export default {
          * @returns {Promise<void>}
          */
         async doSubmit() {
+            if (this.dateRangeIsInvalid()) {
+                return;
+            }
+
             this.processing = true;
 
             if (!this.hasMonitors && !this.hasStatusPages) {
